@@ -1,16 +1,16 @@
-# app/main.py
+# main.py
 import os
 import time
 import asyncio
+from contextlib import asynccontextmanager
 from typing import Optional
 from urllib.parse import urljoin
-from contextlib import asynccontextmanager
 
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Header, Depends
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Query, Body, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse, RedirectResponse
 
 from models import (
     OffersStatelessRequest,
@@ -24,75 +24,57 @@ from models import (
 # ================== CONFIG ==================
 load_dotenv()
 
-def require_env(name: str) -> str:
-    v = os.getenv(name)
-    if not v:
-        raise RuntimeError(f"❌ Variable d'environnement manquante: {name}")
-    return v
+CANAL_BASE = os.environ["CANAL_BASE"].rstrip("/")
+CANAL_AUTH_PATH = os.environ["CANAL_AUTH_PATH"]
+CANAL_USER = os.environ["CANAL_USER"]
+CANAL_PASS = os.environ["CANAL_PASS"]
 
-CANAL_BASE      = require_env("CANAL_BASE").rstrip("/")
-CANAL_AUTH_PATH = require_env("CANAL_AUTH_PATH")
-CANAL_USER      = require_env("CANAL_USER")
-CANAL_PASS      = require_env("CANAL_PASS")
+BOMI_BASE = os.environ.get("BOMI_BASE", "").rstrip("/")
+COUNTRY_ID = os.environ.get("COUNTRY_ID", "114")
+SALE_DEVICE_ID = os.environ.get("SALE_DEVICE_ID", "MYPOS")
+DISTRIBUTOR_ID = os.environ.get("DISTRIBUTOR_ID", "23268")
 
-BOMI_BASE      = os.getenv("BOMI_BASE", "").rstrip("/")
-COUNTRY_ID     = os.getenv("COUNTRY_ID", "114")
-SALE_DEVICE_ID = os.getenv("SALE_DEVICE_ID", "MYPOS")
-DISTRIBUTOR_ID = os.getenv("DISTRIBUTOR_ID", "23268")
+CONNECT_TIMEOUT = float(os.environ.get("CONNECT_TIMEOUT", "10"))
+READ_TIMEOUT = float(os.environ.get("READ_TIMEOUT", "60"))
+WRITE_TIMEOUT = float(os.environ.get("WRITE_TIMEOUT", "30"))
+POOL_TIMEOUT = float(os.environ.get("POOL_TIMEOUT", "10"))
+REFRESH_SAFETY = int(os.environ.get("REFRESH_SAFETY", "15"))
 
-CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "10"))
-READ_TIMEOUT    = float(os.getenv("READ_TIMEOUT", "60"))
-WRITE_TIMEOUT   = float(os.getenv("WRITE_TIMEOUT", "30"))
-POOL_TIMEOUT    = float(os.getenv("POOL_TIMEOUT", "10"))
-REFRESH_SAFETY  = int(os.getenv("REFRESH_SAFETY", "15"))
+# Sécurité simple
+EXPECTED_API_KEY = os.environ.get("X_API_KEY", "").strip()
 
-ALLOWED_ORIGINS = [o for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o]
 API_BASE = f"{CANAL_BASE}/api/rest/onlinesales/v1"
 DEFAULT_TIMEOUT = httpx.Timeout(
     connect=CONNECT_TIMEOUT, read=READ_TIMEOUT, write=WRITE_TIMEOUT, pool=POOL_TIMEOUT
 )
 BASE_HEADERS = {"Accept": "application/json"}
 
-# Optionnel : clé d’API (si vide, pas de check)
-EXPECTED_API_KEY = os.getenv("API_KEY", "").strip()
-
-async def verify_api_key(x_api_key: Optional[str] = Header(default=None)):
-    if not EXPECTED_API_KEY:
-        return True  # pas de clé configurée -> pas de vérif
-    if x_api_key != EXPECTED_API_KEY:
-        raise HTTPException(status_code=401, detail="X-API-KEY invalide")
-    return True
 
 # ================== SESSION CANAL ==================
 class CanalSession:
-    def __init__(self):
+    def __init__(self) -> None:
         self._token: Optional[str] = None
         self._exp: float = 0.0
         self._lock = asyncio.Lock()
         self._client: Optional[httpx.AsyncClient] = None
 
-    async def start(self):
-        self._client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
-        # Auth au boot (si ça échoue, on réessaiera au premier call)
-        try:
-            await self.login()
-        except Exception as e:
-            print("[STARTUP] Auth différée:", e)
+    async def open(self) -> None:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
 
-    async def stop(self):
-        if self._client:
+    async def close(self) -> None:
+        if self._client is not None:
             await self._client.aclose()
             self._client = None
 
     async def login(self) -> None:
-        assert self._client is not None, "client HTTP non initialisé"
+        assert self._client is not None, "client httpx non initialisé"
         url = f"{CANAL_BASE}{CANAL_AUTH_PATH}"
         payload = {"userName": CANAL_USER, "password": CANAL_PASS}
 
         r = await self._client.post(
             url, json=payload, headers={**BASE_HEADERS, "Content-Type": "application/json"}
         )
-        print(f"[AUTH] status={r.status_code} url={url}")
         if r.status_code != 200:
             raise HTTPException(status_code=502, detail=f"Auth failed ({r.status_code})")
 
@@ -101,91 +83,131 @@ class CanalSession:
         if not token:
             raise HTTPException(status_code=502, detail="Auth: 'token' introuvable")
 
-        ttl = 300  # ~5 min (Pas d’info d’expiration fournie)
-        now = time.time()
+        ttl = 300  # 5 min par défaut
         self._token = token
-        self._exp = now + ttl - REFRESH_SAFETY
-        print(f"[AUTH] token en cache ~{ttl - REFRESH_SAFETY}s")
+        self._exp = time.time() + ttl - REFRESH_SAFETY
 
     async def ensure_token(self) -> str:
         async with self._lock:
             if not self._token or time.time() >= self._exp:
                 await self.login()
-            return self._token  # type: ignore
+            return self._token  # type: ignore[return-value]
 
     async def req(self, method: str, url: str, **kwargs) -> httpx.Response:
-        if not self._client:
-            await self.start()
+        assert self._client is not None, "client httpx non initialisé"
         token = await self.ensure_token()
         headers = kwargs.pop("headers", {})
         headers = {**BASE_HEADERS, **headers, "Authorization": f"Bearer {token}"}
 
-        r = await self._client.request(method, url, headers=headers, **kwargs)  # type: ignore
+        r = await self._client.request(method, url, headers=headers, **kwargs)
         if r.status_code == 401:
             async with self._lock:
                 await self.login()
                 headers["Authorization"] = f"Bearer {self._token}"
-            r = await self._client.request(method, url, headers=headers, **kwargs)  # type: ignore
+            r = await self._client.request(method, url, headers=headers, **kwargs)
         return r
+
 
 auth = CanalSession()
 
-# ================== APP (lifespan) ==================
+
+# ================== LIFESPAN (startup/shutdown) ==================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await auth.start()
+    await auth.open()
+    # tentative d'auth au démarrage (non bloquant pour la suite)
+    try:
+        await auth.login()
+    except Exception as e:
+        print("[STARTUP] Auth différée:", e)
     yield
-    await auth.stop()
+    await auth.close()
 
-app = FastAPI(title="RSINC Canal+ Gateway", version="1.2.0", lifespan=lifespan)
+
+# ================== APP ==================
+app = FastAPI(
+    title="RSINC Canal+ Gateway",
+    version="1.2.0",
+    lifespan=lifespan,
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=["*"],  # serre plus finement en prod si besoin
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
 )
 
-# ================== Utils ==================
+# --- Middleware X-API-Key ---
+@app.middleware("http")
+async def api_key_middleware(request: Request, call_next):
+    # Laisse /health et /docs sans clé pour le debug
+    path = request.url.path
+    if path not in ("/health", "/docs", "/openapi.json", "/"):
+        api_key = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
+        if not EXPECTED_API_KEY or api_key != EXPECTED_API_KEY:
+            return JSONResponse(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                content={"detail": "Invalid or missing X-API-Key"},
+            )
+    return await call_next(request)
+
+
 def _to_json_response(r: httpx.Response) -> JSONResponse:
     try:
         return JSONResponse(status_code=r.status_code, content=r.json())
     except Exception:
         return JSONResponse(status_code=r.status_code, content={"raw": r.text})
 
-def _abs_report_url(report_url: str) -> str:
-    return report_url if report_url.startswith("http") else urljoin(CANAL_BASE + "/", report_url.lstrip("/"))
 
-# ================== Health/Auth ==================
+def _abs_report_url(report_url: str) -> str:
+    if report_url.startswith("http"):
+        return report_url
+    return urljoin(CANAL_BASE + "/", report_url.lstrip("/"))
+
+
+# ================== ROUTES ==================
+@app.get("/")
+async def root():
+    # redirige vers la doc
+    return RedirectResponse(url="/docs")
+
+
 @app.get("/health")
 async def health():
     return {"ok": True, "token_cached": bool(auth._token)}
 
-@app.api_route("/authenticate", methods=["GET", "POST"], dependencies=[Depends(verify_api_key)])
+
+@app.api_route("/authenticate", methods=["GET", "POST"])
 async def authenticate():
     await auth.login()
     return {"authenticated": True, "token_cached": True}
 
-# ============ ENDPOINTS Canal+ (lecture) ============
-@app.get("/distributors", dependencies=[Depends(verify_api_key)])
+
+# --------- Canal+ lecture ---------
+@app.get("/distributors")
 async def get_distributors():
     url = f"{API_BASE}/cgaOnlineSales/getDistributors"
     r = await auth.req("GET", url)
     return _to_json_response(r)
 
-@app.get("/distributors/{number}/creditPDV", dependencies=[Depends(verify_api_key)])
+
+@app.get("/distributors/{number}/creditPDV")
 async def credit_pdv(number: str):
     url = f"{API_BASE}/cgaOnlineSales/getDistributors/{number}/creditPDV"
     r = await auth.req("GET", url)
     return _to_json_response(r)
 
-@app.get("/distributors/{number}/rights", dependencies=[Depends(verify_api_key)])
+
+@app.get("/distributors/{number}/rights")
 async def distributor_rights(number: str):
     url = f"{API_BASE}/cgaOnlineSales/getDistributors/{number}/rights"
     r = await auth.req("GET", url)
     return _to_json_response(r)
 
-@app.get("/subscribers", dependencies=[Depends(verify_api_key)])
+
+@app.get("/subscribers")
 async def get_subscribers(
     userId: str,
     distributorNumber: str,
@@ -207,87 +229,98 @@ async def get_subscribers(
     r = await auth.req("GET", url, params=params)
     return _to_json_response(r)
 
-@app.get("/countries", dependencies=[Depends(verify_api_key)])
+
+@app.get("/countries")
 async def get_countries():
     url = f"{API_BASE}/cgaOnlineSales/getCountries"
     r = await auth.req("GET", url)
     return _to_json_response(r)
 
-@app.get("/solde-subscriber/{subscriberId}/{cardIndex}", dependencies=[Depends(verify_api_key)])
+
+@app.get("/solde-subscriber/{subscriberId}/{cardIndex}")
 async def get_solde_subscriber(subscriberId: str, cardIndex: int):
     url = f"{API_BASE}/cgaOnlineSales/getSoldeSubscriber/{subscriberId}/{cardIndex}"
     r = await auth.req("GET", url)
     return _to_json_response(r)
 
-@app.get("/reactivate-possible/{subscriberId}/{cardIndex}", dependencies=[Depends(verify_api_key)])
+
+@app.get("/reactivate-possible/{subscriberId}/{cardIndex}")
 async def is_possible_to_reactivate(subscriberId: str, cardIndex: int):
     url = f"{API_BASE}/cgaOnlineSales/isPossibleToReactivate/{subscriberId}/{cardIndex}"
     r = await auth.req("GET", url)
     return _to_json_response(r)
 
-@app.get("/available-coupons/{subscriberId}/{cardIndex}", dependencies=[Depends(verify_api_key)])
+
+@app.get("/available-coupons/{subscriberId}/{cardIndex}")
 async def get_available_coupons(subscriberId: str, cardIndex: int):
     url = f"{API_BASE}/cgaOnlineSales/getAvailableCoupons/{subscriberId}/{cardIndex}"
     r = await auth.req("GET", url)
     return _to_json_response(r)
 
-@app.get("/eligibility-appointment", dependencies=[Depends(verify_api_key)])
+
+@app.get("/eligibility-appointment")
 async def eligibility_appointment(dateToDate: str = Query(...)):
     url = f"{API_BASE}/cgaOnlineSales/eligibilityAppointment"
     r = await auth.req("GET", url, params={"dateToDate": dateToDate})
     return _to_json_response(r)
 
-@app.get("/can-be-renewed", dependencies=[Depends(verify_api_key)])
-async def can_be_renewed(
-    dateToDate: str = Query("dd"),
-    distributorNumber: str = Query(...),
-):
+
+@app.get("/can-be-renewed")
+async def can_be_renewed(dateToDate: str = Query("dd"), distributorNumber: str = Query(...)):
     url = f"{API_BASE}/cgaOnlineSales/canBeRenewed"
-    r = await auth.req("GET", url, params={"dateToDate": dateToDate, "distributorNumber": distributorNumber})
+    r = await auth.req(
+        "GET", url, params={"dateToDate": dateToDate, "distributorNumber": distributorNumber}
+    )
     return _to_json_response(r)
 
-@app.get("/group-broadcasting-ways", dependencies=[Depends(verify_api_key)])
+
+@app.get("/group-broadcasting-ways")
 async def get_group_broadcasting_ways(dateToDate: str = Query("dd")):
     url = f"{API_BASE}/cgaOnlineSales/getGroupBroadcastingWays"
     r = await auth.req("GET", url, params={"dateToDate": dateToDate})
     return _to_json_response(r)
 
-@app.get("/durations", dependencies=[Depends(verify_api_key)])
-async def get_durations(
-    dateToDate: str = Query("dd"),
-    distributorNumber: str = Query(...),
-):
+
+@app.get("/durations")
+async def get_durations(dateToDate: str = Query("dd"), distributorNumber: str = Query(...)):
     url = f"{API_BASE}/cgaOnlineSales/getDurations"
-    r = await auth.req("GET", url, params={"dateToDate": dateToDate, "distributorNumber": distributorNumber})
+    r = await auth.req(
+        "GET", url, params={"dateToDate": dateToDate, "distributorNumber": distributorNumber}
+    )
     return _to_json_response(r)
 
-@app.get("/payment-methods", dependencies=[Depends(verify_api_key)])
+
+@app.get("/payment-methods")
 async def get_payment_methods(dateToDate: str = Query("dd")):
     url = f"{API_BASE}/cgaOnlineSales/getPaymentMethods"
     r = await auth.req("GET", url, params={"dateToDate": dateToDate})
     return _to_json_response(r)
 
-# ---------- Stateless (POST) ----------
-@app.post("/offers/stateless", dependencies=[Depends(verify_api_key)])
+
+# --------- Stateless (POST) ---------
+@app.post("/offers/stateless")
 async def get_available_offers_stateless(payload: OffersStatelessRequest):
     url = f"{API_BASE}/cgaOnlineSales/getAvailableOffersStateless"
     r = await auth.req("POST", url, json=payload.model_dump(mode="json"))
     return _to_json_response(r)
 
-@app.post("/options/stateless", dependencies=[Depends(verify_api_key)])
+
+@app.post("/options/stateless")
 async def get_available_options_stateless(payload: OptionsStatelessRequest):
     url = f"{API_BASE}/cgaOnlineSales/getAvailableOptionsStateless"
     r = await auth.req("POST", url, json=payload.model_dump(mode="json"))
     return _to_json_response(r)
 
-@app.post("/basket/stateless", dependencies=[Depends(verify_api_key)])
+
+@app.post("/basket/stateless")
 async def get_basket_stateless(payload: BasketStatelessRequest):
     url = f"{API_BASE}/cgaOnlineSales/getBasketStateless"
     r = await auth.req("POST", url, json=payload.model_dump(mode="json"))
     return _to_json_response(r)
 
-# ---------- BOMI ----------
-@app.get("/bomi/payment-means", dependencies=[Depends(verify_api_key)])
+
+# --------- BOMI (informatif) ---------
+@app.get("/bomi/payment-means")
 async def bomi_payment_means(
     countryId: str = Query(COUNTRY_ID),
     managementAct: str = Query("FLASH_RENEWAL"),
@@ -307,7 +340,8 @@ async def bomi_payment_means(
         r = await client.get(url, params=params, headers=BASE_HEADERS)
     return _to_json_response(r)
 
-@app.get("/bomi/payment-means/quick", dependencies=[Depends(verify_api_key)])
+
+@app.get("/bomi/payment-means/quick")
 async def bomi_payment_means_quick(
     countryId: str = Query(COUNTRY_ID),
     managementAct: str = Query("RENEWAL_QUICK"),
@@ -327,15 +361,17 @@ async def bomi_payment_means_quick(
         r = await client.get(url, params=params, headers=BASE_HEADERS)
     return _to_json_response(r)
 
-# ---------- Quick renewal direct ----------
-@app.post("/register-quick-renewal", dependencies=[Depends(verify_api_key)])
+
+# --------- Quick renewal direct ---------
+@app.post("/register-quick-renewal")
 async def register_quick_renewal(payload: QuickRenewalRequest):
     url = f"{API_BASE}/cgaOnlineSales/registerQuickRenewal"
     r = await auth.req("POST", url, json=payload.model_dump(mode="json"))
     return _to_json_response(r)
 
-# ---------- Flow complet + lien PDF ----------
-@app.post("/recharge", dependencies=[Depends(verify_api_key)])
+
+# --------- Flow complet + lien PDF ---------
+@app.post("/recharge")
 async def recharge_flow(flow: RechargeFlowRequest):
     # 1) Basket
     basket_url = f"{API_BASE}/cgaOnlineSales/getBasketStateless"
@@ -344,7 +380,9 @@ async def recharge_flow(flow: RechargeFlowRequest):
         return _to_json_response(r_basket)
     basket_json = r_basket.json()
     if basket_json.get("severity") != "SUCCESS":
-        return JSONResponse(status_code=502, content={"detail": "Panier non SUCCESS", "basket": basket_json})
+        return JSONResponse(
+            status_code=502, content={"detail": "Panier non SUCCESS", "basket": basket_json}
+        )
 
     basket = basket_json.get("basket") or {}
     first_amount = basket.get("firstAmount")
@@ -352,7 +390,7 @@ async def recharge_flow(flow: RechargeFlowRequest):
     sel_offer = basket.get("selectedOffer") or {}
     offer_code = sel_offer.get("offerCode")
 
-    # 2) BOMI (info seulement)
+    # 2) BOMI (non bloquant)
     bomi_json = None
     if BOMI_BASE:
         bomi_url = f"{BOMI_BASE}/api/v1/paymentMeans"
@@ -403,25 +441,35 @@ async def recharge_flow(flow: RechargeFlowRequest):
         },
     )
 
-# ---------- Téléchargement du PDF ----------
-@app.get("/report/download", dependencies=[Depends(verify_api_key)])
-async def report_download_get(reportUrl: str):
-    return await _download_report(reportUrl)
 
-@app.post("/report/download", dependencies=[Depends(verify_api_key)])
-async def report_download_post(body: ReportDownloadRequest):
-    return await _download_report(body.reportUrl)
+# --------- Téléchargement du PDF ---------
+@app.get("/report/download")
+async def report_download_get(reportUrl: Optional[str] = None):
+    if not reportUrl:
+        raise HTTPException(400, "reportUrl manquant (query)")
+    return await _download_report_common(reportUrl)
 
-async def _download_report(reportUrl: str):
-    if not reportUrl or "reports/" not in reportUrl:
+
+@app.post("/report/download")
+async def report_download_post(body: ReportDownloadRequest = Body(...)):
+    return await _download_report_common(body.reportUrl)
+
+
+async def _download_report_common(report_url: str):
+    if "reports/" not in report_url:
         raise HTTPException(400, "reportUrl invalide")
-    url = _abs_report_url(reportUrl)
+    url = _abs_report_url(report_url)
+
     r = await auth.req("GET", url, headers={"Accept": "*/*"})
     ctype = r.headers.get("Content-Type", "").lower()
     fname = "recu.pdf"
     dispo = r.headers.get("Content-Disposition", "")
     if "filename=" in dispo:
-        fname = dispo.split("filename=")[-1].strip('"; ')
+        try:
+            fname = dispo.split("filename=")[-1].strip('"; ')
+        except Exception:
+            pass
+
     if "application/pdf" in ctype or url.lower().endswith(".pdf"):
         return StreamingResponse(
             iter([r.content]),
@@ -433,4 +481,11 @@ async def _download_report(reportUrl: str):
         media_type=ctype or "application/octet-stream",
         headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
-# ================== Endpoints BOMI (lecture) ==================
+
+
+# ================== UVICORN (Railway) ==================
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
