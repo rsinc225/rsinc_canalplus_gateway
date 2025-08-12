@@ -414,3 +414,9 @@ async def _download_report(reportUrl: str):
         media_type=ctype or "application/octet-stream",
         headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
+# ================== UVICORN (Railway) ==================
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
